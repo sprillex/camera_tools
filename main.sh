@@ -1,32 +1,23 @@
 #!/bin/bash
 
 ###############################################################################
-# MAIN - Universal Device Interrogator & Controller
+# MAIN - Organized Device Interrogator
 # ---------------------------------------------------------------------------
-# Hardware: USB-Ethernet Adapter
-# Features: Collision Bypass, Passive/Active Discovery, Wireshark Recording,
-#           ONVIF Auto-Fetch, and Interactive Menu.
+# Hierarchy: Manufacturer / Model / Camera_Name / {PCAP, MAC_FILE.txt}
 ###############################################################################
 
 # --- USER CONFIGURATION ---
 TARGET_MAC="00:e0:4c:68:00:f5"
-LOG_DIR="./device_logs"
+BASE_LOG_DIR="./device_logs"
 MY_TEMP_IP="250"
 VENV_PATH="./camera_env/bin/activate"
 # --------------------------
 
-# 1. AUTO-LOCATE INTERFACE BY MAC
+# 1. AUTO-LOCATE INTERFACE
 INTERFACE=$(ip -br link | grep -i "$TARGET_MAC" | awk '{print $1}')
+[ -z "$INTERFACE" ] && { echo "Error: Adapter not found."; exit 1; }
 
-if [ -z "$INTERFACE" ]; then
-    echo "ERROR: Adapter with MAC $TARGET_MAC not found."
-    echo "Check connection or verify MAC in script."
-    exit 1
-fi
-
-mkdir -p "$LOG_DIR"
-
-# Detect home network to avoid routing collisions
+mkdir -p "$BASE_LOG_DIR"
 HOME_INT=$(ip route | grep default | awk '{print $5}' | head -n 1)
 HOME_SUB=$(ip -4 addr show "$HOME_INT" | grep -oP '(?<=inet\s)\d+(\.\d+){2}' | head -n 1)
 
@@ -37,68 +28,118 @@ setup_network() {
     sudo ip link set "$INTERFACE" up
     sudo ip addr flush dev "$INTERFACE"
 
-    echo "Listening for heartbeats (10s)..."
-    DET_IP=$(sudo timeout 10s tcpdump -i "$INTERFACE" -n -c 1 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | grep -v '0.0.0.0' | head -n 1)
+    echo "Listening for valid host traffic (15s)..."
+    DET_IP=$(sudo timeout 15s tcpdump -i "$INTERFACE" -n -c 1 "not multicast and not broadcast" 2>/dev/null | \
+             grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+             grep -vE '0.0.0.0|224\.|239\.|255\.' | head -n 1)
 
     if [ -z "$DET_IP" ]; then
-        echo "No traffic found. Trying active ARP scan..."
-        DET_IP=$(sudo arp-scan --interface="$INTERFACE" --localnet | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+        echo "No valid traffic caught."
+        # Use user-configured or input IP for probing
+        PROBE_IP_BASE="192.168.1"
+        PROBE_IP="${PROBE_IP_BASE}.${MY_TEMP_IP}"
+
+        read -p "Enter Probe IP to use for active scan (Default: $PROBE_IP): " USER_PROBE_IP
+        if [ ! -z "$USER_PROBE_IP" ]; then
+             PROBE_IP="$USER_PROBE_IP"
+        fi
+
+        # Check if the IP is already in use on the local network (if applicable) before assigning
+        if ping -c 1 -W 1 "$PROBE_IP" &> /dev/null; then
+             echo "WARNING: IP $PROBE_IP appears to be in use! Aborting scan to avoid conflict."
+             return 1
+        fi
+
+        echo "Assigning probe IP $PROBE_IP/24 and scanning..."
+        sudo ip addr add "$PROBE_IP/24" dev "$INTERFACE"
+
+        # Scan common subnets
+        DET_IP=$(sudo arp-scan --interface="$INTERFACE" 192.168.1.0/24 192.168.0.0/24 10.0.0.0/24 2>/dev/null | \
+                 grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+                 grep -v "$PROBE_IP" | head -n 1)
     fi
 
     if [ -z "$DET_IP" ]; then
-        echo "Device not found. Try power-cycling the camera."
+        echo "FAIL: Device not found."
+        sudo ip addr flush dev "$INTERFACE"
         return 1
     fi
 
+    sudo ip addr flush dev "$INTERFACE"
     DEV_SUB=$(echo "$DET_IP" | cut -d. -f1-3)
-    sudo ip addr add "$DEV_SUB.$MY_TEMP_IP/24" dev "$INTERFACE"
 
-    if [ "$DEV_SUB" == "$HOME_SUB" ]; then
-        echo "Collision detected! Prioritizing USB path for $DET_IP."
-        sudo ip route add "$DET_IP" dev "$INTERFACE" metric 10
+    # Check for conflict with target device IP before assigning our own address in that subnet
+    MY_ADDR="$DEV_SUB.$MY_TEMP_IP"
+    if ping -c 1 -W 1 "$MY_ADDR" &> /dev/null; then
+         echo "WARNING: $MY_ADDR is in use. Please select a different host suffix."
+         read -p "Enter new host suffix (e.g. 251): " NEW_SUFFIX
+         MY_ADDR="$DEV_SUB.$NEW_SUFFIX"
     fi
-    echo -e "\e[32mConnected to: $DET_IP\e[0m"
+
+    sudo ip addr add "$MY_ADDR/24" dev "$INTERFACE"
+    [ "$DEV_SUB" == "$HOME_SUB" ] && sudo ip route add "$DET_IP" dev "$INTERFACE" metric 10
+
+    echo -e "\e[32mCONNECTED TO: $DET_IP\e[0m"
 }
 
 run_interrogation() {
-    [ -z "$DET_IP" ] && { echo "Please Connect (Option 1) first."; return; }
-    TS=$(date +%Y%m%d_%H%M%S)
-    LOG="$LOG_DIR/details_$TS.log"
-    PCAP="$LOG_DIR/capture_$TS.pcap"
+    [ -z "$DET_IP" ] && { echo "Connect first."; return; }
 
-    echo "Starting PCAP capture & Nmap scan..."
+    # Identify MAC and Manufacturer
+    MAC=$(ip neighbor show | grep "$DET_IP" | awk '{print $5}')
+    [ -z "$MAC" ] && MAC=$(sudo arp-scan --interface="$INTERFACE" "$DET_IP" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
+
+    RAW_MANU=$(grep -i "${MAC:0:8}" /usr/share/nmap/nmap-mac-prefixes | awk '{$1=""; print $0}' | sed 's/^ //g')
+    MANU=${RAW_MANU:-"Unknown_Manufacturer"}
+    MANU_PATH=$(echo "$MANU" | tr ' ' '_')
+
+    # Get User Details
+    echo -e "\n--- Organization Details ---"
+    read -p "Enter Camera Model: " CAM_MODEL
+    CAM_MODEL=${CAM_MODEL:-"Generic_Model"}
+    read -p "Enter Camera Name: " CAM_NAME
+    CAM_NAME=${CAM_NAME:-"Unnamed_Cam"}
+
+    # Finalize Directory and File paths
+    FINAL_DIR="$BASE_LOG_DIR/$MANU_PATH/$CAM_MODEL/$CAM_NAME"
+    MAC_FILE="$FINAL_DIR/${MAC//:/}.txt"
+    TS=$(date +%Y%m%d_%H%M%S)
+    PCAP="$FINAL_DIR/capture_$TS.pcap"
+
+    mkdir -p "$FINAL_DIR"
+    echo "Saving data to $FINAL_DIR"
+
+    # Start Wireshark-compatible capture
     sudo tcpdump -i "$INTERFACE" -w "$PCAP" & TCP_PID=$!
 
-    MAC=$(ip neighbor show | grep "$DET_IP" | awk '{print $5}')
-    MANU=$(grep -i "${MAC:0:8}" /usr/share/nmap/nmap-mac-prefixes | awk '{for(i=2;i<=NF;i++) printf "%s ", $i; print ""}')
-
     {
-        echo "=== DEVICE REPORT: $TS ==="
-        echo "IP: $DET_IP | MAC: $MAC | Vendor: ${MANU:-Unknown}"
+        echo "=== DEVICE INTERROGATION REPORT ==="
+        echo "Timestamp:    $(date)"
+        echo "Camera Name:  $CAM_NAME"
+        echo "Model:        $CAM_MODEL"
+        echo "IP:           $DET_IP"
+        echo "MAC:          $MAC"
+        echo "Vendor:       $MANU"
         echo "------------------------------------------------"
         sudo nmap -sV -O -F "$DET_IP"
-    } | tee "$LOG"
-
-    echo -e "\nInterrogation complete. Files saved to $LOG_DIR."
+    } | tee "$MAC_FILE"
 }
 
 auto_fetch_rtsp() {
-    [ -z "$DET_IP" ] && { echo "Connect first."; return; }
-    if [ ! -f "$VENV_PATH" ]; then
-        echo "Error: Python venv not found at $VENV_PATH."
+    if [[ -z "$FINAL_DIR" || -z "$MAC_FILE" ]]; then
+        echo "Run Interrogation (Option 2) first to define the camera folder."
         return
     fi
 
-    echo "Testing credentials against ONVIF service..."
+    echo "Checking ONVIF for RTSP path..."
     while IFS=: read -r USER PASS; do
         echo -n "Trying $USER:$PASS ... "
-        RESULT=$(source "$VENV_PATH" && python3 get_rtsp_path.py "$DET_IP" "$USER" "$PASS")
+        RESULT=$(source "$VENV_PATH" && python3 get_rtsp_path.py "$DET_IP" "$USER" "$PASS" 2>/dev/null)
 
         if [[ $RESULT == *"SUCCESS_URL"* ]]; then
             URL=$(echo "$RESULT" | cut -d':' -f2-)
             echo -e "\e[32mFOUND!\e[0m"
-            echo -e "\nURL: $URL\n"
-            echo "RTSP_URL: $URL ($USER:$PASS)" >> "$LOG_DIR/details_$(date +%Y%m%d).log"
+            echo -e "\nVerified RTSP URL ($USER:$PASS):\n$URL" >> "$MAC_FILE"
             return
         else
             echo "Failed."
@@ -107,7 +148,7 @@ auto_fetch_rtsp() {
 }
 
 cleanup() {
-    echo "Cleaning up network and background processes..."
+    echo "Resetting adapter..."
     [ ! -z "$TCP_PID" ] && sudo kill "$TCP_PID" 2>/dev/null
     sudo ip route del "$DET_IP" dev "$INTERFACE" 2>/dev/null
     sudo ip addr flush dev "$INTERFACE"
@@ -115,12 +156,12 @@ cleanup() {
 
 # --- MENU ---
 while true; do
-    echo -e "\n\e[1m--- CAMERA TOOLKIT MENU ---\e[0m"
+    echo -e "\n--- CAMERA TOOLKIT ---"
     echo "1) Connect & Discover (Find IP)"
-    echo "2) Interrogate & Capture (Log/PCAP)"
+    echo "2) Interrogate & Capture (Setup Folders/Nmap/PCAP)"
     echo "3) Auto-Fetch RTSP (via ONVIF)"
     echo "4) Brute-Force RTSP (Fallback Script)"
-    echo "5) Cleanup / Reset Adapter"
+    echo "5) Reset Adapter / Cleanup"
     echo "6) Exit"
     read -p "Selection: " opt
     case $opt in
