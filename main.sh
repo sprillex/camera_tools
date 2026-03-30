@@ -17,6 +17,8 @@ FINAL_DIR=""
 MAC_FILE=""
 TCP_PID=""
 TCP_RAW_PID=""
+WS_PID=""
+WS_TEMP_DIR="/tmp/ws_discovery_data"
 
 # 1. AUTO-LOCATE INTERFACE
 INTERFACE=$(ip -br link | grep -i "$TARGET_MAC" | awk '{print $1}')
@@ -32,6 +34,7 @@ cleanup() {
     echo -e "\nResetting adapter and terminating background processes..."
     [ -n "$TCP_PID" ] && sudo kill "$TCP_PID" 2>/dev/null
     [ -n "$TCP_RAW_PID" ] && sudo kill "$TCP_RAW_PID" 2>/dev/null
+    [ -n "$WS_PID" ] && sudo kill "$WS_PID" 2>/dev/null
     sudo pkill -f "dnsmasq.*camera_dhcp" 2>/dev/null
     rm -f /tmp/dnsmasq_camera.pid /tmp/camera_dhcp.leases /tmp/camera_raw.txt 2>/dev/null
     sudo ip addr flush dev "$INTERFACE" 2>/dev/null
@@ -122,7 +125,11 @@ listen_universal() {
 
     sudo tcpdump -i "$INTERFACE" -nn -l "ip and not host $TRAP_IP and not host 0.0.0.0 and not (dst net 224.0.0.0/4)" > "$RAW_FILE" 2>/dev/null & TCP_RAW_PID=$!
 
-    echo -e "\e[33m[1/3] HARVESTING PHASE: Capturing all traffic for 90 seconds...\e[0m"
+    # Start WS-Discovery listener
+    mkdir -p "$WS_TEMP_DIR"
+    source "$VENV_PATH" && python3 ws_discovery_listener.py "$TRAP_IP" "$WS_TEMP_DIR" > /dev/null 2>&1 & WS_PID=$!
+
+    echo -e "\e[33m[1/3] HARVESTING PHASE: Capturing all traffic for 90 seconds (including WS-Discovery)...\e[0m"
     echo "Power cycle the camera NOW."
 
     CAPTURE_END=$((SECONDS + 90))
@@ -139,6 +146,10 @@ listen_universal() {
 
     sudo pkill -f "dnsmasq.*camera_dhcp" 2>/dev/null
     sudo kill "$TCP_RAW_PID" 2>/dev/null
+    if [ -n "$WS_PID" ]; then
+        sudo kill "$WS_PID" 2>/dev/null
+        WS_PID=""
+    fi
 
     # [2/3] VALIDATION PHASE - FIXED SUBNET SWITCHING
     echo -e "\e[33m[2/3] VALIDATION PHASE: Verifying addresses with subnet matching...\e[0m"
@@ -210,6 +221,19 @@ run_interrogation() {
     mkdir -p "$FINAL_DIR"; MAC_FILE="$FINAL_DIR/${MAC_STR}.txt"
     PCAP="$FINAL_DIR/capture_$(date +%H%M%S).pcap"
 
+    # Move any captured WS-Discovery data for this IP to the final directory
+    if [ -d "$WS_TEMP_DIR" ]; then
+        WS_RAW="$WS_TEMP_DIR/ws_discovery_${DET_IP}_raw.xml"
+        WS_INFO="$WS_TEMP_DIR/ws_discovery_${DET_IP}_info.txt"
+
+        if [ -f "$WS_RAW" ]; then
+            echo -e "\e[32mFound WS-Discovery data for $DET_IP. Moving to final directory.\e[0m"
+            mv "$WS_RAW" "$FINAL_DIR/"
+            [ -f "$WS_INFO" ] && mv "$WS_INFO" "$FINAL_DIR/"
+            cat "$FINAL_DIR/$(basename "$WS_INFO")" >> "$MAC_FILE" 2>/dev/null
+        fi
+    fi
+
     # Kill any existing tcpdump session for interrogation to prevent zombies
     if [ -n "$TCP_PID" ]; then
         sudo kill "$TCP_PID" 2>/dev/null
@@ -230,6 +254,11 @@ run_interrogation() {
         sudo kill "$TCP_PID" 2>/dev/null
         TCP_PID=""
     fi
+
+    # Graceful ONVIF Extraction (Device Info, Capabilities, RTSP URL)
+    echo -e "\n=== ONVIF ENUMERATION ===" | tee -a "$MAC_FILE"
+    echo "Attempting graceful extraction (unauthenticated first, then brute-force)..."
+    source "$VENV_PATH" && python3 onvif_interrogator.py "$DET_IP" "camera_creds.txt" 2>/dev/null | tee -a "$MAC_FILE"
 }
 
 setup_network() {
@@ -273,6 +302,15 @@ setup_network() {
 
 auto_fetch_rtsp() {
     if [[ -z "$FINAL_DIR" || -z "$MAC_FILE" ]]; then echo "Run Option 3 first."; return; fi
+
+    # Check if the graceful Option 3 extraction already retrieved the URL
+    if grep -q "Graceful RTSP Extraction:" "$MAC_FILE" && ! grep -q "Graceful RTSP Extraction: FAILED" "$MAC_FILE"; then
+        echo -e "\e[32mRTSP URL was already gracefully extracted during Interrogation (Option 3).\e[0m"
+        grep -A 1 "Graceful RTSP Extraction:" "$MAC_FILE"
+        return
+    fi
+
+    echo -e "\e[33mGraceful extraction not found. Attempting Zeep brute-force...\e[0m"
     while IFS=: read -r USER PASS; do
         [[ -z "$USER" || "$USER" == \#* ]] && continue
         echo -n "Trying $USER:$PASS ... "
