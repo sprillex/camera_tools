@@ -155,12 +155,14 @@ listen_universal() {
         fi
 
         # Set our adapter to match the subnet of the found IP
-        sudo ip addr add "$VALIDATION_IP/24" dev "$INTERFACE"
+        sudo ip addr add "$VALIDATION_IP/24" brd + dev "$INTERFACE"
         sudo ip link set "$INTERFACE" up
-        sleep 1
 
-        # arping is better than ping for this; it doesn't care about firewalls as much
-        if sudo arping -c 2 -w 1 -I "$INTERFACE" "$ip" > /dev/null 2>&1; then
+        # Give the interface time to settle routing and link states
+        sleep 3
+
+        # Use arp-scan to match the reliable behavior seen in Option 1
+        if sudo arp-scan --interface="$INTERFACE" "$ip" 2>/dev/null | grep -q "$ip"; then
             echo -e "\e[32mALIVE\e[0m"
             VALID_IPS+=("$ip")
         else
