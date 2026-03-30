@@ -1,0 +1,5 @@
+camera_env/
+device_logs/
+__pycache__/
+*.pcap
+*.log

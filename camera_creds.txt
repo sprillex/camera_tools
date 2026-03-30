@@ -1,0 +1,10 @@
+admin:admin
+admin:12345
+admin:password
+admin:123456
+admin:
+root:root
+root:pass
+admin:msfadmin
+support:support
+user:user
