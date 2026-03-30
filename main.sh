@@ -254,6 +254,11 @@ run_interrogation() {
         sudo kill "$TCP_PID" 2>/dev/null
         TCP_PID=""
     fi
+
+    # Graceful ONVIF Extraction (Device Info, Capabilities, RTSP URL)
+    echo -e "\n=== ONVIF ENUMERATION ===" | tee -a "$MAC_FILE"
+    echo "Attempting graceful extraction (unauthenticated first, then brute-force)..."
+    source "$VENV_PATH" && python3 onvif_interrogator.py "$DET_IP" "camera_creds.txt" 2>/dev/null | tee -a "$MAC_FILE"
 }
 
 setup_network() {
@@ -297,6 +302,15 @@ setup_network() {
 
 auto_fetch_rtsp() {
     if [[ -z "$FINAL_DIR" || -z "$MAC_FILE" ]]; then echo "Run Option 3 first."; return; fi
+
+    # Check if the graceful Option 3 extraction already retrieved the URL
+    if grep -q "Graceful RTSP Extraction:" "$MAC_FILE" && ! grep -q "Graceful RTSP Extraction: FAILED" "$MAC_FILE"; then
+        echo -e "\e[32mRTSP URL was already gracefully extracted during Interrogation (Option 3).\e[0m"
+        grep -A 1 "Graceful RTSP Extraction:" "$MAC_FILE"
+        return
+    fi
+
+    echo -e "\e[33mGraceful extraction not found. Attempting Zeep brute-force...\e[0m"
     while IFS=: read -r USER PASS; do
         [[ -z "$USER" || "$USER" == \#* ]] && continue
         echo -n "Trying $USER:$PASS ... "
