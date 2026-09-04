@@ -300,6 +300,20 @@ setup_network() {
     DET_IP=""
 }
 
+run_security_evaluation() {
+    if [[ -z "$FINAL_DIR" || -z "$MAC_FILE" ]]; then
+        echo -e "\e[31mERROR: Run Option 3 (Interrogate & Capture) first to generate the MAC report.\e[0m"
+        return
+    fi
+    echo -e "\n--- Running Security Evaluation ---"
+
+    # Run the python evaluator and capture its output
+    # The evaluator appends directly to the MAC_FILE.txt
+    source "$VENV_PATH" && python3 security_evaluator.py "$DET_IP" "$MAC_FILE" "camera_creds.txt" | tee -a "$MAC_FILE"
+
+    echo -e "\e[32mSecurity Evaluation complete. Results appended to $MAC_FILE\e[0m"
+}
+
 auto_fetch_rtsp() {
     if [[ -z "$FINAL_DIR" || -z "$MAC_FILE" ]]; then echo "Run Option 3 first."; return; fi
 
@@ -332,16 +346,18 @@ while true; do
     echo "2) Universal Boot Trap (Smart Validation)"
     echo "3) Interrogate & Capture"
     echo "4) Auto-Fetch RTSP"
-    echo "5) Reset / Clear Target"
-    echo "6) Exit"
+    echo "5) Run Security Evaluation"
+    echo "6) Reset / Clear Target"
+    echo "7) Exit"
     read -p "Selection: " opt
     case $opt in
         1) read -p "Enter Subnet (CIDR) or [Enter]: " S_RANGE; setup_network "$S_RANGE" ;;
         2) listen_universal ;;
         3) run_interrogation ;;
         4) auto_fetch_rtsp ;;
-        5) DET_IP=""; cleanup ;;
-        6) cleanup; exit 0 ;;
+        5) run_security_evaluation ;;
+        6) DET_IP=""; cleanup ;;
+        7) cleanup; exit 0 ;;
         *) echo "Invalid option." ;;
     esac
 done
